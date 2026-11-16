@@ -9,6 +9,7 @@ from discord.ext import commands, tasks
 
 from payments import PaymentService
 from store_db import open_store, StoreError
+from manual_payment import BankDetails
 
 log = logging.getLogger(__name__)
 STATUS = {"pending": "Chờ thanh toán", "paid": "Đã thanh toán", "fulfilling": "Đang xử lý",
@@ -63,6 +64,13 @@ def order_embed(order):
 
 def payment_message(order):
     kwargs = {"embed": order_embed(order)}
+    if order["provider"] == "manual":
+        if order["status"] == "pending" and order.get("checkout_url"):
+            kwargs["embed"].set_image(url=order["checkout_url"])
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label="Mở QR chuyển khoản", url=order["checkout_url"]))
+            kwargs["view"] = view
+        return kwargs
     if order["status"] == "pending" and order.get("checkout_url"):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Mở trang thanh toán", url=order["checkout_url"]))
@@ -158,6 +166,11 @@ class Store(commands.Cog):
             raise StoreError("Chỉ Administrator được cấu hình cửa hàng.")
 
     async def owned_order(self, ctx, code):
+        if len(code.strip()) == 6 and code.strip().isascii() and code.strip().isalnum():
+            order = await asyncio.to_thread(self.db.transfer_order, code.strip(), ctx.guild.id)
+            if order["buyer_id"] != ctx.author.id and not await self.staff(ctx.guild, ctx.author.id):
+                raise StoreError("Bạn không có quyền xem đơn này.")
+            return order
         try:
             number = int(code)
         except ValueError as exc:
@@ -205,9 +218,17 @@ class Store(commands.Cog):
         self.buy_cooldowns[key] = now
         if len(self.buy_cooldowns) > 10000:
             self.buy_cooldowns = {k: t for k, t in self.buy_cooldowns.items() if now - t < 60}
-        order = await asyncio.to_thread(self.db.reserve, guild, buyer, sku, quantity, self.payments.mode)
+        bank, ttl = None, 900
+        if self.payments.mode == "manual":
+            try:
+                bank = BankDetails.from_env()
+            except ValueError as exc:
+                raise StoreError(str(exc)) from exc
+            ttl = 86400
+        order = await asyncio.to_thread(self.db.reserve, guild, buyer, sku, quantity, self.payments.mode, ttl, bank)
         if order["provider"] == "manual":
-            return order, "Đơn thanh toán thủ công: liên hệ nhân viên lấy thông tin chuyển khoản."
+            return order, (f"Chuyển đúng {money(order['total'])}, nội dung chính xác **{order['description']}**. "
+                           "Người bán kiểm tra tiền về và xác nhận đơn. Đã chuyển thì không hủy hoặc chuyển lần nữa.")
         try:
             order = await self.payments.ensure_payment(order)
             return order, "Quét QR hoặc mở trang payOS. Giữ nguyên số tiền và nội dung do payOS cung cấp."
@@ -303,7 +324,7 @@ class Store(commands.Cog):
     @staticmethod
     def order_lines(rows):
         return "\n".join(f"`{r['code']}` · {safe(r['name'][:40])} ×{r['quantity']} · "
-                         f"{money(r['total'])} · {STATUS[r['status']]}" for r in rows) or "Chưa có đơn."
+                         f"{money(r['total'])} · {STATUS[r['status']]} | CK: {safe(r.get('description') or '-')}" for r in rows) or "Chưa có đơn."
 
     @store.command(name="order", description="Xem và đối soát trạng thái đơn")
     @commands.cooldown(1, 10, commands.BucketType.member)
@@ -323,7 +344,7 @@ class Store(commands.Cog):
     async def payment(self, ctx, code: str):
         order = await self.owned_order(ctx, code)
         if order["provider"] != "payos":
-            return await self.private(ctx, "Đơn manual: liên hệ nhân viên để nhận thông tin chuyển khoản.")
+            return await self.private(ctx, "Người bán xác nhận sau khi kiểm tra tiền về.", **payment_message(order))
         try:
             order = await self.payments.sync(order)
         except Exception:
@@ -403,6 +424,8 @@ class Store(commands.Cog):
                 # The event keeps its state even if the order has since advanced.
                 embed = discord.Embed(title=f"Đơn #{row['code']}: {STATUS[row['notice_status']]}",
                     description=f"{safe(row['name'])} ×{row['quantity']} · {money(row['total'])}")
+                if row.get("description"):
+                    embed.add_field(name="Mã chuyển khoản", value=safe(row["description"]))
                 ok = True
                 try:
                     user = self.bot.get_user(row["buyer_id"]) or await self.bot.fetch_user(row["buyer_id"])

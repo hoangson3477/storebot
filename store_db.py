@@ -38,6 +38,8 @@ class StoreDB:
                 paid_at INTEGER, review_reason TEXT, checked_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS orders_guild ON orders(guild_id,created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS manual_transfer_code ON orders(description)
+                WHERE provider='manual' AND description IS NOT NULL;
             CREATE TABLE IF NOT EXISTS payment_events (
                 reference TEXT PRIMARY KEY, order_code INTEGER NOT NULL,
                 amount INTEGER NOT NULL, created_at INTEGER NOT NULL
@@ -127,7 +129,7 @@ class StoreDB:
                 "SELECT * FROM products WHERE guild_id=? AND active=1 ORDER BY id LIMIT 10 OFFSET ?",
                 (guild, (page - 1) * 10))]
 
-    def reserve(self, guild, buyer, sku, quantity, provider, ttl=900):
+    def reserve(self, guild, buyer, sku, quantity, provider, ttl=900, bank=None):
         if not 1 <= quantity <= 100:
             raise StoreError("Số lượng từ 1 đến 100.")
         if provider not in ("manual", "payos"):
@@ -149,12 +151,24 @@ class StoreDB:
                 code = 1_000_000_000_000 + secrets.randbelow(8_000_000_000_000)
                 if not db.execute("SELECT 1 FROM orders WHERE code=?", (code,)).fetchone():
                     break
+            memo, qr_url, account, name = None, None, None, None
+            if provider == "manual":
+                for _ in range(100):
+                    memo = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(6))
+                    if not db.execute("SELECT 1 FROM orders WHERE provider='manual' AND description=?", (memo,)).fetchone():
+                        break
+                else:
+                    raise StoreError("Không tạo được mã chuyển khoản duy nhất.")
+                if bank:
+                    qr_url, account, name = bank.qr_url(total, memo), bank.account, bank.name
             db.execute("UPDATE products SET stock=stock-? WHERE id=?", (quantity, product["id"]))
             db.execute("INSERT INTO orders(code,guild_id,buyer_id,product_id,name,unit_price,quantity,total,"
-                       "provider,created_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                       "provider,created_at,expires_at,description,checkout_url,account_number,account_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (code, guild, buyer, product["id"], product["name"], product["price"], quantity,
-                        total, provider, now, now + ttl))
+                        total, provider, now, now + ttl, memo, qr_url, account, name))
             self.audit(db, guild, buyer, "reserve", str(code))
+            if provider == "manual":
+                self.notice(db, code, "pending")
             return dict(db.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone())
 
     def order(self, code, guild=None):
@@ -173,6 +187,14 @@ class StoreDB:
                 args.append(buyer)
             return [dict(r) for r in db.execute(query + " ORDER BY created_at DESC,code DESC LIMIT 10 OFFSET ?",
                                                 (*args, (page - 1) * 10))]
+
+    def transfer_order(self, memo, guild):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM orders WHERE guild_id=? AND provider='manual' AND description=?",
+                             (guild, memo.upper())).fetchone()
+            if not row:
+                raise StoreError("Không tìm thấy mã chuyển khoản trong server này.")
+            return dict(row)
 
     def bind_payment(self, code, data):
         with self.connect(True) as db:

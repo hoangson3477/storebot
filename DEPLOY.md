@@ -1,5 +1,7 @@
 # Chạy storebot từ GitHub trên host/VPS
 
+**Thanh toán hiện dùng QR + người bán xác nhận:** đọc [MANUAL_PAYMENT.md](MANUAL_PAYMENT.md), điền BANK_BIN/BANK_ACCOUNT/BANK_ACCOUNT_NAME và giữ PAYMENT_PROVIDER=manual. Không cần làm mục payOS, cổng HTTP hoặc tên miền ở phía dưới cho chế độ manual.
+
 Repo: https://github.com/hoangson3477/storebot
 
 ## 1. Supabase đã chuẩn bị

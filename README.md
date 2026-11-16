@@ -1,5 +1,7 @@
 # Manage and Store — AI setup và cửa hàng
 
+Thanh toán mặc định: **QR chuyển khoản + mã ngẫu nhiên 6 ký tự + nhân viên xác nhận**. Xem [MANUAL_PAYMENT.md](MANUAL_PAYMENT.md). Không cần cấu hình payOS cho luồng này.
+
 Bot có setup server bằng AI và cửa hàng: sản phẩm, tồn kho, đơn hàng, xác nhận thủ công hoặc payOS QR/webhook. Xem [STORE_GUIDE.md](STORE_GUIDE.md) để cấu hình cửa hàng và thanh toán.
 
 **Triển khai mới: đọc [DEPLOY.md](DEPLOY.md) trước.** Backend mặc định là PostgreSQL/Supabase (`DATABASE_URL`); muốn thử SQLite local phải đặt `STORE_BACKEND=sqlite`. Mẫu cấu hình trong `.env.example`. Database wargame dùng schema storebot riêng. Không commit `.env`.

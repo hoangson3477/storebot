@@ -23,6 +23,8 @@ class StoreCommandTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.env = patch.dict(os.environ, {"DATABASE_URL": "", "STORE_BACKEND": "sqlite", "PAYMENT_PROVIDER": "manual", "STORE_DB_PATH": str(Path(self.temp.name) / "test.db")})
         self.env.start()
+        self.bank_env = patch.dict(os.environ, {"BANK_BIN": "970436", "BANK_ACCOUNT": "123456789", "BANK_ACCOUNT_NAME": "TEST STORE"})
+        self.bank_env.start()
         self.bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
         await self.bot.__aenter__()
         await self.bot.load_extension("store")
@@ -32,6 +34,7 @@ class StoreCommandTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.bot.close()
         self.env.stop()
+        self.bank_env.stop()
         self.temp.cleanup()
 
     async def test_slash_commands_register_without_connecting_discord(self):
@@ -55,11 +58,12 @@ class StoreCommandTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StoreError):
             await self.store.owned_order(ctx, str(order["code"]))
 
-    async def test_manual_order_returns_no_fake_qr(self):
+    async def test_manual_order_returns_bank_qr_without_claiming_payment(self):
         order, warning = await self.store.place_order(1, 10, "TEST", 1)
         message = payment_message(order)
         self.assertNotIn("file", message)
-        self.assertNotIn("view", message)
+        self.assertIn("view", message)
+        self.assertIn("img.vietqr.io", message["embed"].image.url)
         self.assertEqual(order["status"], "pending")
         self.assertTrue(warning)
 

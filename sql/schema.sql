@@ -42,6 +42,8 @@ SET LOCAL search_path TO storebot, pg_catalog;
             );
             
 CREATE INDEX IF NOT EXISTS events_order ON payment_events(order_code);
+CREATE UNIQUE INDEX IF NOT EXISTS manual_transfer_code ON orders(description)
+    WHERE provider='manual' AND description IS NOT NULL;
 
 ALTER TABLE storebot.settings ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON storebot.settings FROM PUBLIC, anon, authenticated;
