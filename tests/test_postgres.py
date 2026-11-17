@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 import test_store_db
+import test_tickets
 
 
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Set TEST_DATABASE_URL to a disposable local PostgreSQL database")
@@ -30,4 +31,28 @@ class PostgresContractTests(test_store_db.StoreDBTests):
         self.db.edit_product(1, 99, "KEY", price=50000)
         reopened = PostgresStoreDB(os.environ["TEST_DATABASE_URL"], sslmode="disable")
         self.assertEqual(reopened.order(row["code"])["total"], 10000)
+        self.assertEqual(reopened.products(1)[0]["stock"], 4)
+
+
+@unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Set TEST_DATABASE_URL to a disposable local PostgreSQL database")
+class PostgresTicketContractTests(test_tickets.TicketDBTests):
+    def setUp(self):
+        PostgresContractTests.setUp(self)
+        self.db.init_tickets()
+        self.db.configure(1, 99, 50, 60)
+        self.db.configure_tickets(1, 99, 70)
+        self.order = self.db.reserve(1, 10, "KEY", 1, "manual", ttl=86400)
+
+    def tearDown(self):
+        pass
+
+    def test_persists_after_restart_without_changing_order_or_stock(self):
+        from postgres_db import PostgresStoreDB
+        self.bind()
+        reopened = PostgresStoreDB(os.environ["TEST_DATABASE_URL"], sslmode="disable")
+        reopened.init_tickets()
+        self.assertEqual(reopened.ticket_category(1), 70)
+        self.assertEqual(reopened.settings(1)["staff_role_id"], 50)
+        self.assertEqual(reopened.ticket(1, code=self.order["code"])["channel_id"], 100)
+        self.assertEqual(reopened.order(self.order["code"]), self.order)
         self.assertEqual(reopened.products(1)[0]["stock"], 4)

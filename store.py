@@ -10,6 +10,7 @@ from discord.ext import commands, tasks
 from payments import PaymentService
 from store_db import open_store, StoreError
 from manual_payment import BankDetails
+from store_tickets import TicketManager
 
 log = logging.getLogger(__name__)
 STATUS = {"pending": "Chờ thanh toán", "paid": "Đã thanh toán", "fulfilling": "Đang xử lý",
@@ -106,6 +107,7 @@ class BuyModal(discord.ui.Modal, title="Đặt hàng"):
                 raise StoreError("Số lượng phải là số nguyên.") from exc
             order, warning = await self.cog.place_order(interaction.guild_id, interaction.user.id,
                                                        self.sku.value, quantity)
+            warning += await self.cog.ticket_delivery(interaction.guild, order)
             await interaction.followup.send(content=warning or None, **payment_message(order), ephemeral=True)
         except StoreError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
@@ -128,13 +130,16 @@ class Store(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.db = open_store()
+        self.db.init_tickets()
         self.payments = PaymentService(self.db)
         self.buy_cooldowns = {}
         self.front = Storefront(self)
+        self.tickets = TicketManager(self)
 
     async def cog_load(self):
         await self.payments.start()
         self.bot.add_view(self.front)
+        self.bot.add_view(self.tickets.controls)
         self.maintenance.start()
         self.notify.start()
 
@@ -142,6 +147,7 @@ class Store(commands.Cog):
         self.maintenance.cancel()
         self.notify.cancel()
         self.bot.remove_view(self.front)
+        self.bot.remove_view(self.tickets.controls)
         await self.payments.close()
 
     async def cog_check(self, ctx):
@@ -237,6 +243,17 @@ class Store(commands.Cog):
             return order, ("Đã lưu đơn nhưng chưa lấy được QR. Dùng /store payment với mã đơn này để thử lại; "
                            "không cần đặt đơn mới. Kho vẫn được giữ để tránh bán trùng.")
 
+    async def ticket_delivery(self, guild, order):
+        if not await asyncio.to_thread(self.db.ticket_category, guild.id):
+            return ""
+        try:
+            channel = await self.tickets.open(guild, order)
+            return f"\nTicket mua hàng: {channel.mention}"
+        except Exception:
+            log.exception("Could not open ticket for order %s", order["code"])
+            return ("\nĐơn đã lưu nhưng chưa mở được ticket. Bạn vẫn dùng QR bên dưới; "
+                    f"nhờ admin kiểm tra quyền rồi dùng `/store ticket code: {order['code']}`. Không cần đặt lại.")
+
     @commands.hybrid_group(name="store", description="Cửa hàng và quản lý đơn", invoke_without_command=True)
     @commands.guild_only()
     async def store(self, ctx):
@@ -244,12 +261,8 @@ class Store(commands.Cog):
 
     @store.command(name="help", description="Hướng dẫn cửa hàng")
     async def help_command(self, ctx):
-        await self.private(ctx, "**Khách:** products [page], buy <sku> [quantity], orders [page], order <code>, "
-            "payment <code>, cancel <code>.\n**Nhân viên:** add <sku> <price> <stock> <name> [description], "
-            "edit <sku> [price] [stock_delta] [active], allorders [page], paid <code>, "
-            "process <code>, complete <code>, revenue.\n**Admin:** configure <staff_role> <log_channel>.\n"
-            "Thêm /store phía trước để dùng slash, hoặc !store với lệnh tin nhắn. "
-            "Với !store add, đặt tên/mô tả có khoảng trắng trong dấu nháy kép. Giá tính bằng VND.")
+        from help_content import build_help
+        await self.private(ctx, embed=build_help("store"))
 
     @store.command(name="configure", description="Chọn role nhân viên và kênh log riêng tư")
     async def configure(self, ctx, staff_role: discord.Role, log_channel: discord.TextChannel):
@@ -295,7 +308,13 @@ class Store(commands.Cog):
     async def panel(self, ctx, page: int = 1):
         await self.require_staff(ctx)
         rows = await asyncio.to_thread(self.db.products, ctx.guild.id, max(1, min(page, 10000)))
-        embed = discord.Embed(title="Cửa hàng", description="Bấm Mua sản phẩm, nhập mã SKU và số lượng.", color=discord.Color.green())
+        ticket_enabled = await asyncio.to_thread(self.db.ticket_category, ctx.guild.id)
+        description = "Bấm **Mua sản phẩm**, nhập mã SKU và số lượng để đặt hàng."
+        if ticket_enabled:
+            description += " Bot mở **ticket mua hàng riêng** kèm QR để bạn trao đổi với nhân viên."
+        else:
+            description += " Bot gửi thông tin thanh toán riêng cho bạn."
+        embed = discord.Embed(title=f"Cửa hàng — trang {page}", description=description, color=discord.Color.green())
         for row in rows:
             embed.add_field(name=f"{row['sku']} · {safe(row['name'])}"[:256],
                             value=f"{money(row['price'])} · Còn {row['stock']}", inline=False)
@@ -303,11 +322,37 @@ class Store(commands.Cog):
         await ctx.channel.send(embed=embed, view=Storefront(self))
         await self.private(ctx, "Đã đăng bảng bán hàng công khai.")
 
+    @store.command(name="ticketsetup", description="Admin chọn category tạo ticket mua hàng riêng")
+    async def ticketsetup(self, ctx, category: discord.CategoryChannel):
+        await self.require_admin(ctx)
+        settings = await asyncio.to_thread(self.db.settings, ctx.guild.id)
+        role = ctx.guild.get_role(settings.get("staff_role_id"))
+        if not role or role.is_default() or role.managed:
+            raise StoreError("Chạy /store configure để chọn role nhân viên trước.")
+        perms = category.permissions_for(ctx.guild.me)
+        if not all((perms.manage_channels, perms.manage_roles, perms.view_channel, perms.send_messages, perms.embed_links, perms.attach_files)):
+            raise StoreError("Bot cần Manage Channels, Manage Roles, View Channel, Send Messages, Embed Links, Attach Files tại category.")
+        await asyncio.to_thread(self.db.configure_tickets, ctx.guild.id, ctx.author.id, category.id)
+        await self.private(ctx, "Đã bật ticket mua hàng. Khách mua từ panel hoặc /store buy sẽ có ticket riêng kèm QR.")
+
+    @store.command(name="ticket", description="Mở hoặc lấy lại ticket cho đơn hàng có sẵn")
+    async def ticket(self, ctx, code: str):
+        order = await self.owned_order(ctx, code)
+        channel = await self.tickets.open(ctx.guild, order)
+        await self.private(ctx, f"Ticket của đơn: {channel.mention}")
+
+    @store.command(name="ticketclose", description="Nhân viên đóng ticket hiện tại sau khi xử lý xong đơn")
+    async def ticketclose(self, ctx):
+        await self.require_staff(ctx)
+        await self.tickets.close(ctx.guild, ctx.channel, ctx.author.id)
+        await self.private(ctx, "Đã đóng ticket, giữ lại lịch sử và thông tin đơn.")
+
     @store.command(name="buy", description="Đặt sản phẩm và nhận thanh toán riêng tư")
     async def buy(self, ctx, sku: str, quantity: int = 1):
         if not ctx.interaction:
             await self.private(ctx, "Đang tạo đơn hàng của bạn…")  # Verify DM delivery before reserving stock.
         order, message = await self.place_order(ctx.guild.id, ctx.author.id, sku, quantity)
+        message += await self.ticket_delivery(ctx.guild, order)
         await self.private(ctx, message, **payment_message(order))
 
     @store.command(name="orders", description="Xem các đơn của bạn")
@@ -435,6 +480,19 @@ class Store(commands.Cog):
                 except discord.HTTPException:
                     ok = False
                 settings = await asyncio.to_thread(self.db.settings, row["guild_id"])
+                ticket = await asyncio.to_thread(self.db.ticket, row["guild_id"], code=row["code"])
+                if ticket and not ticket["closed"]:
+                    try:
+                        channel = self.bot.get_channel(ticket["channel_id"]) or await self.bot.fetch_channel(ticket["channel_id"])
+                        if channel.guild.id == row["guild_id"]:
+                            await self.tickets.check_private(channel, ticket)
+                            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                    except discord.NotFound:
+                        pass  # An externally deleted ticket does not block other notices.
+                    except StoreError:
+                        log.warning("Skipping non-private ticket %s", ticket["channel_id"])
+                    except discord.HTTPException:
+                        ok = False
                 if settings.get("log_channel_id"):
                     try:
                         channel = self.bot.get_channel(settings["log_channel_id"]) or await self.bot.fetch_channel(settings["log_channel_id"])

@@ -86,6 +86,60 @@ class StoreDB:
             row = db.execute("SELECT * FROM settings WHERE guild_id=?", (guild,)).fetchone()
             return dict(row) if row else {}
 
+    def init_tickets(self):
+        # Portable additive schema: also used by PostgreSQL, without resetting store data.
+        with self.connect(True) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS ticket_settings (guild_id BIGINT PRIMARY KEY, category_id BIGINT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS tickets (order_code BIGINT PRIMARY KEY REFERENCES orders(code), "
+                       "guild_id BIGINT NOT NULL, buyer_id BIGINT NOT NULL, channel_id BIGINT NOT NULL UNIQUE, "
+                       "closed BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)")
+
+    def ticket_category(self, guild):
+        with self.connect() as db:
+            row = db.execute("SELECT category_id FROM ticket_settings WHERE guild_id=?", (guild,)).fetchone()
+            return row["category_id"] if row else None
+
+    def configure_tickets(self, guild, actor, category):
+        with self.connect(True) as db:
+            db.execute("INSERT INTO ticket_settings(guild_id,category_id) VALUES(?,?) ON CONFLICT(guild_id) "
+                       "DO UPDATE SET category_id=excluded.category_id", (guild, category))
+            self.audit(db, guild, actor, "ticket_configure", str(category))
+
+    def ticket(self, guild, *, code=None, channel=None):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM tickets WHERE guild_id=? AND " +
+                             ("order_code=?" if code is not None else "channel_id=?"),
+                             (guild, code if code is not None else channel)).fetchone()
+            return dict(row) if row else None
+
+    def bind_ticket(self, code, guild, buyer, channel):
+        with self.connect(True) as db:
+            order = db.execute("SELECT * FROM orders WHERE code=? AND guild_id=? AND buyer_id=?",
+                               (code, guild, buyer)).fetchone()
+            if not order:
+                raise StoreError("Không tìm thấy đơn của khách trong server này.")
+            old = db.execute("SELECT * FROM tickets WHERE order_code=?", (code,)).fetchone()
+            if old:
+                raise StoreError("Đơn đã có ticket. Dùng /store ticket để mở lại đường dẫn.")
+            db.execute("INSERT INTO tickets(order_code,guild_id,buyer_id,channel_id,created_at) VALUES(?,?,?,?,?)",
+                       (code, guild, buyer, channel, int(time.time())))
+            self.audit(db, guild, buyer, "ticket_open", f"{code}: channel={channel}")
+
+    def forget_missing_ticket(self, guild, channel):
+        with self.connect(True) as db:
+            db.execute("DELETE FROM tickets WHERE guild_id=? AND channel_id=? AND closed=0", (guild, channel))
+
+    def close_ticket(self, guild, channel, actor):
+        with self.connect(True) as db:
+            row = db.execute("SELECT t.*,o.status FROM tickets t JOIN orders o ON o.code=t.order_code "
+                             "WHERE t.guild_id=? AND t.channel_id=?", (guild, channel)).fetchone()
+            if not row or row["closed"]:
+                raise StoreError("Ticket không tồn tại hoặc đã đóng.")
+            if row["status"] not in ("completed", "cancelled", "expired"):
+                raise StoreError("Chỉ đóng ticket khi đơn đã hoàn thành, đã hủy hoặc hết hạn.")
+            db.execute("UPDATE tickets SET closed=1 WHERE channel_id=?", (channel,))
+            self.audit(db, guild, actor, "ticket_close", str(row["order_code"]))
+
     def configure(self, guild, actor, staff, channel):
         with self.connect(True) as db:
             db.execute("INSERT INTO settings VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "

@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from plan import Plan
 from ai_setup import propose
+from help_content import build_help
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -147,7 +148,19 @@ class Bot(commands.Bot):
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions.none())
+bot = Bot(command_prefix="!", intents=intents, help_command=None, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.hybrid_command(name="help", description="Hướng dẫn setup AI, mua hàng và quản lý cửa hàng")
+@app_commands.describe(topic="Phần hướng dẫn muốn xem")
+@app_commands.choices(topic=[app_commands.Choice(name=name, value=value) for name, value in (
+    ("Tất cả", "all"), ("Setup AI", "setup"), ("Cửa hàng", "store"),
+    ("Nhân viên", "staff"), ("Admin", "admin"))])
+async def help_command(ctx: commands.Context, topic: str = "all"):
+    topic = topic.lower().strip()
+    if topic not in ("all", "setup", "store", "staff", "admin"):
+        return await ctx.send("Dùng /help với topic: all, setup, store, staff hoặc admin.", ephemeral=True)
+    await ctx.send(embed=build_help(topic), ephemeral=True)
 
 
 @bot.event

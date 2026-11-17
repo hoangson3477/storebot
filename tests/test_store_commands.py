@@ -40,7 +40,8 @@ class StoreCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_slash_commands_register_without_connecting_discord(self):
         command = self.bot.tree.get_command("store")
         names = {c.name for c in command.commands}
-        self.assertTrue({"buy", "products", "panel", "configure", "order", "payment", "complete"} <= names)
+        self.assertTrue({"buy", "products", "panel", "configure", "order", "payment", "complete",
+                         "ticketsetup", "ticket", "ticketclose"} <= names)
         payload = command.to_dict(self.bot.tree)
         self.assertEqual(payload["name"], "store")
         self.assertLessEqual(len(payload["options"]), 25)

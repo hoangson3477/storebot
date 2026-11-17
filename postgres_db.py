@@ -16,6 +16,13 @@ class SQLConnection:
 
 
 class PostgresStoreDB(StoreDB):
+    def init_tickets(self):
+        super().init_tickets()
+        with self.connect(True) as db:
+            for table in ("tickets", "ticket_settings"):
+                db.execute(f"ALTER TABLE storebot.{table} ENABLE ROW LEVEL SECURITY")
+                db.execute(f"REVOKE ALL ON storebot.{table} FROM PUBLIC, anon, authenticated")
+
     def __init__(self, url, *, sslmode="require"):
         import psycopg
         if sslmode != "require":
