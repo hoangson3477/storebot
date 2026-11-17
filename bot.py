@@ -10,39 +10,12 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from plan import Plan, SYSTEM_PROMPT
+from plan import Plan
+from ai_setup import propose
 
 load_dotenv()
 log = logging.getLogger(__name__)
 locks: dict[int, asyncio.Lock] = {}
-
-
-async def propose(description: str) -> Plan:
-    key, model = os.getenv("AI_API_KEY"), os.getenv("AI_MODEL")
-    if not key or not model:
-        raise ValueError("Chưa cấu hình AI_API_KEY và AI_MODEL trong .env.")
-    base = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    if not base.startswith("https://"):
-        raise ValueError("AI_BASE_URL phải dùng HTTPS.")
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-        async with session.post(
-            base + "/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": model, "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": description},
-            ], "response_format": {"type": "json_object"}, "max_tokens": 4000},
-        ) as response:
-            if response.status != 200:
-                raise ValueError(f"AI trả lỗi HTTP {response.status}. Kiểm tra API key, model và hạn mức.")
-            body = await response.json()
-    try:
-        choice = body["choices"][0]
-        if choice.get("finish_reason") == "length":
-            raise ValueError("Truncated")
-        return Plan.model_validate_json(choice["message"]["content"])
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
-        raise ValueError("AI trả cấu trúc không hợp lệ. Hãy chạy setup lại với mô tả rõ hơn.") from exc
 
 
 def preview(plan: Plan) -> str:

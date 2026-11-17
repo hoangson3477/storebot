@@ -1,5 +1,7 @@
 # Manage and Store — AI setup và cửa hàng
 
+AI setup mặc định dùng **Gemini native REST + JSON Schema**. Xem [GEMINI_SETUP.md](GEMINI_SETUP.md). Cấu hình Google cũ có đuôi `/v1beta/openai` vẫn được nhận diện; key/model hiện tại không bị sửa.
+
 Thanh toán mặc định: **QR chuyển khoản + mã ngẫu nhiên 6 ký tự + nhân viên xác nhận**. Xem [MANUAL_PAYMENT.md](MANUAL_PAYMENT.md). Không cần cấu hình payOS cho luồng này.
 
 Bot có setup server bằng AI và cửa hàng: sản phẩm, tồn kho, đơn hàng, xác nhận thủ công hoặc payOS QR/webhook. Xem [STORE_GUIDE.md](STORE_GUIDE.md) để cấu hình cửa hàng và thanh toán.
@@ -10,7 +12,7 @@ Bot có setup server bằng AI và cửa hàng: sản phẩm, tồn kho, đơn h
 
 1. Cài Python 3.11 trở lên, chạy `python -m pip install -r requirements.txt`.
 2. Copy `.env.example` thành `.env`, điền Discord token, API key, model.
-3. AI_BASE_URL là URL gốc API Chat Completions tương thích OpenAI (kết thúc bằng /v1), không phải URL website chat. Model phải hỗ trợ JSON object. Không mặc định miễn phí; hạn mức tùy nhà cung cấp.
+3. Điền AI_BASE_URL, AI_API_KEY, AI_MODEL theo GEMINI_SETUP.md. Gemini dùng URL gốc https://generativelanguage.googleapis.com/v1beta; hạn mức tùy tài khoản/nhà cung cấp.
 4. Trong Discord Developer Portal, bật Message Content Intent để dùng `!setup`.
 5. Mời bot với scopes `bot`, `applications.commands`; cấp View Channels, Send Messages, Attach Files, Read Message History, Manage Channels, Manage Roles. Đặt role bot cao hơn các role bot cần quản lý.
 6. Điền TEST_GUILD_ID để thử slash command trên server riêng; nếu bỏ trống, bot sync global và Discord có thể cần thời gian hiển thị.
