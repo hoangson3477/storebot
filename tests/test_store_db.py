@@ -179,6 +179,17 @@ class StoreDBTests(unittest.TestCase):
         with self.assertRaises(StoreError):
             self.db.resolve_unpaid(row["code"], 1, 99, "Cannot ignore actual funds")
 
+    def test_reconciliation_does_not_reset_fulfillment_after_payment_review(self):
+        row = self.order()
+        self.db.receive(row["code"], row["total"], row["link_id"], "initial-payment")
+        self.db.advance(row["code"], 1, 99, "fulfilling")
+        self.db.reconcile(row["code"], self.remote(row, "PENDING", row["total"]))
+        self.assertEqual(self.db.order(row["code"])["status"], "review")
+        self.db.reconcile(row["code"], self.remote(row))
+        self.assertEqual(self.db.order(row["code"])["status"], "review")
+        with self.assertRaises(StoreError):
+            self.db.advance(row["code"], 1, 99, "fulfilling")
+
 
 if __name__ == "__main__":
     unittest.main()

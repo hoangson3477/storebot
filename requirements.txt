@@ -4,4 +4,4 @@ python-dotenv>=1,<2
 pydantic>=2,<3
 payos==1.1.1
 qrcode[pil]>=8,<9
-psycopg[binary]==3.2.10
+psycopg[binary]==3.3.9

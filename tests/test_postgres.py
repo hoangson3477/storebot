@@ -19,6 +19,7 @@ class PostgresContractTests(test_store_db.StoreDBTests):
             connection.execute(Path("sql/schema.sql").read_text(encoding="utf-8"), prepare=False)
             connection.execute("TRUNCATE storebot.outbox,storebot.audit,storebot.payment_events,storebot.orders,storebot.products,storebot.settings RESTART IDENTITY CASCADE")
         self.db = PostgresStoreDB(url, sslmode="disable")
+        self.db.add_product(1, 99, "KEY", "License", "Test product", 10000, 5)
 
     def tearDown(self):
         pass

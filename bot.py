@@ -148,6 +148,8 @@ class Confirm(discord.ui.View):
 
     @discord.ui.button(label="Hủy", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.used:
+            return await interaction.response.send_message("Bản setup này đang được xử lý hoặc đã kết thúc.", ephemeral=True)
         self.used = True
         self.stop()
         await interaction.response.edit_message(content="Đã hủy setup.", view=None)
@@ -173,6 +175,11 @@ class Bot(commands.Bot):
 intents = discord.Intents.default()
 intents.message_content = True
 bot = Bot(command_prefix="!", intents=intents, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.event
+async def on_ready():
+    log.info("Bot online | bot_id=%s | servers=%s", bot.user.id, len(bot.guilds))
 
 
 @bot.hybrid_command(name="setup", description="AI đề xuất cấu trúc server theo yêu cầu")
@@ -222,4 +229,4 @@ if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise SystemExit("Thiếu DISCORD_TOKEN trong .env")
-    bot.run(token)
+    bot.run(token, log_handler=None)

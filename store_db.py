@@ -246,6 +246,10 @@ class StoreDB:
     def _paid(self, db, row):
         if row["status"] in ("paid", "fulfilling", "completed"):
             return "duplicate"
+        if row["status"] == "review" and row["paid_at"] is not None:
+            # An already-paid order may have been in fulfillment before a payment dispute.
+            # Do not silently reset its progress or authorize fulfillment again.
+            return "review"
         if not row["reserved"]:
             self._review(db, row, "Nhận tiền sau khi đơn đã giải phóng kho; cần nhân viên xử lý.")
             return "review"
