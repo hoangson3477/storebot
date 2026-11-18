@@ -8,9 +8,11 @@ import discord
 from discord.ext import commands, tasks
 
 from payments import PaymentService
-from store_db import open_store, StoreError
+from store_db import open_store, StoreError, DatabaseUnavailable
+from network_health import BackgroundBackoff, temporary_dns_error
 from manual_payment import BankDetails
 from store_tickets import TicketManager
+from diagnostics import begin_command, interaction_context, unwrap_error
 
 log = logging.getLogger(__name__)
 STATUS = {"pending": "Chờ thanh toán", "paid": "Đã thanh toán", "fulfilling": "Đang xử lý",
@@ -23,6 +25,17 @@ def money(value):
 
 def safe(value):
     return discord.utils.escape_markdown(discord.utils.escape_mentions(str(value)))
+
+
+def panel_permissions(channel, member):
+    perms = channel.permissions_for(member)
+    required = [("view_channel", "View Channel (Xem kênh)"),
+                ("embed_links", "Embed Links (Nhúng liên kết)")]
+    if isinstance(channel, discord.Thread):
+        required.append(("send_messages_in_threads", "Send Messages in Threads (Gửi tin trong luồng)"))
+    else:
+        required.append(("send_messages", "Send Messages (Gửi tin nhắn)"))
+    return [label for flag, label in required if not getattr(perms, flag)]
 
 
 def private_log(channel, staff_role_id, bot_id):
@@ -97,6 +110,8 @@ class BuyModal(discord.ui.Modal, title="Đặt hàng"):
         self.cog = cog
 
     async def on_submit(self, interaction: discord.Interaction):
+        interaction_context(interaction)
+        log.info("purchase.modal_submitted")
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             if not interaction.guild_id:
@@ -110,6 +125,7 @@ class BuyModal(discord.ui.Modal, title="Đặt hàng"):
             warning += await self.cog.ticket_delivery(interaction.guild, order)
             await interaction.followup.send(content=warning or None, **payment_message(order), ephemeral=True)
         except StoreError as exc:
+            log.warning("purchase.rejected reason=%s", exc)
             await interaction.followup.send(str(exc), ephemeral=True)
         except Exception:
             log.exception("Buy modal failed")
@@ -123,6 +139,8 @@ class Storefront(discord.ui.View):
 
     @discord.ui.button(label="Mua sản phẩm", style=discord.ButtonStyle.green, custom_id="manageandstore:buy:v1")
     async def buy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        interaction_context(interaction)
+        log.info("purchase.panel_clicked")
         await interaction.response.send_modal(BuyModal(self.cog))
 
 
@@ -133,8 +151,11 @@ class Store(commands.Cog):
         self.db.init_tickets()
         self.payments = PaymentService(self.db)
         self.buy_cooldowns = {}
+        self.maintenance_backoff = BackgroundBackoff(30)
+        self.notify_backoff = BackgroundBackoff(15)
         self.front = Storefront(self)
         self.tickets = TicketManager(self)
+        log.info("store.initialized backend=%s payment_provider=%s", type(self.db).__name__, self.payments.mode)
 
     async def cog_load(self):
         await self.payments.start()
@@ -142,6 +163,7 @@ class Store(commands.Cog):
         self.bot.add_view(self.tickets.controls)
         self.maintenance.start()
         self.notify.start()
+        log.info("store.loaded persistent_views=2 maintenance_interval=30 notification_interval=15")
 
     async def cog_unload(self):
         self.maintenance.cancel()
@@ -149,6 +171,7 @@ class Store(commands.Cog):
         self.bot.remove_view(self.front)
         self.bot.remove_view(self.tickets.controls)
         await self.payments.close()
+        log.info("store.unloaded")
 
     async def cog_check(self, ctx):
         if ctx.guild is None:
@@ -201,22 +224,37 @@ class Store(commands.Cog):
             await ctx.defer(ephemeral=True)
 
     async def cog_command_error(self, ctx, error):
-        original = getattr(error, "original", error)
+        begin_command(ctx)
+        original = unwrap_error(error)
         if isinstance(original, StoreError):
             message = str(original)
+            log.warning("command.rejected command=%s reason=%s", ctx.command, original,
+                        exc_info=(type(original), original, original.__traceback__) if original.__cause__ else None)
+        elif isinstance(original, discord.Forbidden):
+            message = ("Bot thiếu quyền Discord tại kênh đang dùng. Kiểm tra View Channel, "
+                       "Send Messages và Embed Links trong quyền kênh/category; "
+                       "nếu dùng luồng, cần Send Messages in Threads. Quyền ghi đè của kênh cũng phải cho phép bot.")
+            log.warning("Store command %s denied by Discord in channel %s (code=%s)",
+                        ctx.command, ctx.channel.id, original.code,
+                        exc_info=(type(original), original, original.__traceback__))
         elif isinstance(error, commands.NoPrivateMessage):
+            log.warning("command.rejected command=%s reason=guild_only", ctx.command)
             message = "Lệnh cửa hàng chỉ dùng trong server."
         elif isinstance(error, commands.UserInputError):
+            log.warning("command.rejected command=%s error_type=%s", ctx.command, type(error).__name__)
             message = "Thiếu hoặc sai tham số. Dùng /store help để xem hướng dẫn."
         elif isinstance(error, (commands.CommandOnCooldown, commands.MaxConcurrencyReached)):
+            log.warning("command.throttled command=%s error_type=%s", ctx.command, type(error).__name__)
             message = "Bạn thao tác quá nhanh. Hãy chờ vài giây."
         else:
-            log.error("Store command failed", exc_info=(type(original), original, original.__traceback__))
-            message = "Không xử lý được. Dùng /store orders kiểm tra đơn trước khi thử lại."
+            log.error("command.failed command=%s error_type=%s", ctx.command, type(original).__name__,
+                      exc_info=(type(original), original, original.__traceback__))
+            message = f"Không xử lý được. Mã tra log: {ctx.log_reference}. Dùng /store orders kiểm tra đơn trước khi thử lại."
         # Errors never disclose order details in a public prefix response.
         await ctx.send(message, ephemeral=True)
 
     async def place_order(self, guild, buyer, sku, quantity):
+        log.info("purchase.started guild=%s buyer=%s quantity=%s provider=%s", guild, buyer, quantity, self.payments.mode)
         now = time.monotonic()
         key = (guild, buyer)
         if now - self.buy_cooldowns.get(key, -100) < 10:
@@ -232,7 +270,10 @@ class Store(commands.Cog):
                 raise StoreError(str(exc)) from exc
             ttl = 86400
         order = await asyncio.to_thread(self.db.reserve, guild, buyer, sku, quantity, self.payments.mode, ttl, bank)
+        log.info("purchase.reserved order=%s guild=%s buyer=%s total=%s expires_at=%s", order["code"], guild,
+                 buyer, order["total"], order["expires_at"])
         if order["provider"] == "manual":
+            log.info("payment.manual_qr_ready order=%s status=pending", order["code"])
             return order, (f"Chuyển đúng {money(order['total'])}, nội dung chính xác **{order['description']}**. "
                            "Người bán kiểm tra tiền về và xác nhận đơn. Đã chuyển thì không hủy hoặc chuyển lần nữa.")
         try:
@@ -245,6 +286,7 @@ class Store(commands.Cog):
 
     async def ticket_delivery(self, guild, order):
         if not await asyncio.to_thread(self.db.ticket_category, guild.id):
+            log.debug("ticket.skipped order=%s reason=not_configured", order["code"])
             return ""
         try:
             channel = await self.tickets.open(guild, order)
@@ -307,6 +349,12 @@ class Store(commands.Cog):
     @store.command(name="panel", description="Đăng catalog có nút mua công khai tại kênh hiện tại")
     async def panel(self, ctx, page: int = 1):
         await self.require_staff(ctx)
+        me = ctx.guild.me or await ctx.guild.fetch_member(self.bot.user.id)
+        missing = panel_permissions(ctx.channel, me)
+        if missing:
+            log.warning("panel.permissions_missing channel=%s permissions=%s", ctx.channel.id, missing)
+            raise StoreError("Chưa đăng được panel. Bot thiếu: " + ", ".join(missing) +
+                             ". Vào Chỉnh sửa kênh → Quyền → chọn bot và bật các quyền trên, rồi chạy lại /store panel.")
         rows = await asyncio.to_thread(self.db.products, ctx.guild.id, max(1, min(page, 10000)))
         ticket_enabled = await asyncio.to_thread(self.db.ticket_category, ctx.guild.id)
         description = "Bấm **Mua sản phẩm**, nhập mã SKU và số lượng để đặt hàng."
@@ -319,7 +367,14 @@ class Store(commands.Cog):
             embed.add_field(name=f"{row['sku']} · {safe(row['name'])}"[:256],
                             value=f"{money(row['price'])} · Còn {row['stock']}", inline=False)
         embed.set_footer(text="Giá/tồn kho trên bảng là lúc đăng. Bot kiểm tra lại khi đặt hàng.")
-        await ctx.channel.send(embed=embed, view=Storefront(self))
+        try:
+            log.info("panel.publishing channel=%s page=%s products=%s ticket_enabled=%s", ctx.channel.id,
+                     page, len(rows), bool(ticket_enabled))
+            await ctx.channel.send(embed=embed, view=Storefront(self))
+        except discord.Forbidden as exc:
+            raise StoreError("Discord từ chối đăng panel (50013). Kiểm tra quyền ghi đè của bot tại kênh/category: "
+                             "View Channel, Send Messages, Embed Links; nếu là luồng, kiểm tra quyền gửi và trạng thái khóa luồng.") from exc
+        log.info("panel.published channel=%s products=%s", ctx.channel.id, len(rows))
         await self.private(ctx, "Đã đăng bảng bán hàng công khai.")
 
     @store.command(name="ticketsetup", description="Admin chọn category tạo ticket mua hàng riêng")
@@ -380,7 +435,7 @@ class Store(commands.Cog):
             try:
                 order = await self.payments.sync(order)
             except Exception:
-                log.exception("Manual order reconciliation failed for %s", order["code"])
+                log.exception("payment.order_reconcile_failed order=%s", order["code"])
                 warning = "Chưa kết nối được payOS; dưới đây là trạng thái đang lưu."
         await self.private(ctx, warning, **payment_message(order))
 
@@ -394,7 +449,7 @@ class Store(commands.Cog):
             order = await self.payments.sync(order)
         except Exception:
             # A previous create may not have reached payOS; retry uses the same unique order code.
-            pass
+            log.exception("payment.sync_failed_before_retry order=%s", order["code"])
         if order["status"] == "pending":
             order = await self.payments.ensure_payment(order)
         await self.private(ctx, **payment_message(order))
@@ -453,8 +508,15 @@ class Store(commands.Cog):
                     try:
                         await self.payments.sync(row)
                     except Exception:
-                        log.warning("Could not reconcile order %s; retaining stock", row["code"])
-        except Exception:
+                        log.exception("maintenance.reconcile_failed order=%s stock_retained=true", row["code"])
+            if self.maintenance_backoff.recovered():
+                self.maintenance.change_interval(seconds=30)
+                log.info("maintenance.recovered interval_seconds=30")
+        except Exception as exc:
+            if isinstance(exc, DatabaseUnavailable) or temporary_dns_error(exc):
+                delay = self.maintenance_backoff.failed()
+                self.maintenance.change_interval(seconds=delay)
+                log.warning("maintenance.dns_backoff failures=%s next_run_seconds=%s", self.maintenance_backoff.failures, delay)
             log.exception("Store maintenance failed")
 
     @maintenance.before_loop
@@ -463,6 +525,9 @@ class Store(commands.Cog):
 
     @tasks.loop(seconds=15)
     async def notify(self):
+        if not self.bot.is_ready():
+            log.debug("notification.skipped reason=gateway_not_ready")
+            return
         try:
             notices = await asyncio.to_thread(self.db.notifications)
             for row in notices:
@@ -476,8 +541,10 @@ class Store(commands.Cog):
                     user = self.bot.get_user(row["buyer_id"]) or await self.bot.fetch_user(row["buyer_id"])
                     await user.send(embed=embed)
                 except discord.Forbidden:
+                    log.warning("notification.dm_blocked order=%s buyer=%s", row["code"], row["buyer_id"])
                     pass  # User can still inspect persistent state via /store orders.
                 except discord.HTTPException:
+                    log.exception("notification.dm_failed order=%s buyer=%s", row["code"], row["buyer_id"])
                     ok = False
                 settings = await asyncio.to_thread(self.db.settings, row["guild_id"])
                 ticket = await asyncio.to_thread(self.db.ticket, row["guild_id"], code=row["code"])
@@ -488,10 +555,12 @@ class Store(commands.Cog):
                             await self.tickets.check_private(channel, ticket)
                             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                     except discord.NotFound:
+                        log.warning("notification.ticket_missing order=%s channel=%s", row["code"], ticket["channel_id"])
                         pass  # An externally deleted ticket does not block other notices.
                     except StoreError:
                         log.warning("Skipping non-private ticket %s", ticket["channel_id"])
                     except discord.HTTPException:
+                        log.exception("notification.ticket_failed order=%s channel=%s", row["code"], ticket["channel_id"])
                         ok = False
                 if settings.get("log_channel_id"):
                     try:
@@ -503,9 +572,19 @@ class Store(commands.Cog):
                         else:
                             log.warning("Skipping non-private store log channel for guild %s", row["guild_id"])
                     except discord.HTTPException:
+                        log.exception("notification.staff_log_failed order=%s channel=%s", row["code"], settings["log_channel_id"])
                         ok = False
                 await asyncio.to_thread(self.db.notification_done, row["notice_id"], ok)
-        except Exception:
+                log.debug("notification.finished order=%s event=%s ok=%s attempt=%s", row["code"],
+                          row["notice_status"], ok, row["attempts"] + 1)
+            if self.notify_backoff.recovered():
+                self.notify.change_interval(seconds=15)
+                log.info("notification.recovered interval_seconds=15")
+        except Exception as exc:
+            if isinstance(exc, DatabaseUnavailable) or temporary_dns_error(exc):
+                delay = self.notify_backoff.failed()
+                self.notify.change_interval(seconds=delay)
+                log.warning("notification.dns_backoff failures=%s next_run_seconds=%s", self.notify_backoff.failures, delay)
             log.exception("Store notifications failed")
 
     @notify.before_loop

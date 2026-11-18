@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from urllib.parse import urlparse
 
 import aiohttp
@@ -115,7 +116,11 @@ async def propose(description: str) -> Plan:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         for attempt in range(3):
             url, headers, payload = build_request(base, model, key, messages, schema, 6000 if attempt == 0 else 8192)
+            started = time.monotonic()
+            log.info("ai.request_started provider_host=%s model=%s attempt=%s", urlparse(base).hostname, model, attempt + 1)
             async with session.post(url, headers=headers, json=payload) as response:
+                log.info("ai.response status=%s attempt=%s elapsed_ms=%.0f", response.status, attempt + 1,
+                         (time.monotonic() - started) * 1000)
                 if response.status != 200:
                     hints = {401: "API key không hợp lệ", 403: "không có quyền dùng model",
                              404: "sai endpoint hoặc model", 429: "hết hạn mức hoặc gọi quá nhanh"}
@@ -125,7 +130,10 @@ async def propose(description: str) -> Plan:
                 except (ValueError, aiohttp.ContentTypeError):
                     raise ValueError("Endpoint AI không trả JSON. Kiểm tra AI_BASE_URL.") from None
             try:
-                return parse_plan(body)
+                plan = parse_plan(body)
+                log.info("ai.plan_validated attempt=%s categories=%s channels=%s", attempt + 1, len(plan.categories),
+                         sum(len(category.channels) for category in plan.categories))
+                return plan
             except InvalidPlan as exc:
                 last_error = str(exc)
                 log.warning("Setup response invalid (attempt %s): %s", attempt + 1, last_error)

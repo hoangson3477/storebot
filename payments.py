@@ -36,6 +36,7 @@ class PaymentService:
 
     async def start(self):
         if not self.client:
+            log.info("payment.started provider=manual webhook_enabled=false")
             return
         app = self.application()
         self.runner = web.AppRunner(app)
@@ -43,7 +44,9 @@ class PaymentService:
         try:
             await web.TCPSite(self.runner, os.getenv("PAYMENT_HOST", "127.0.0.1"),
                              int(os.getenv("PAYMENT_PORT", "8080"))).start()
+            log.info("payment.started provider=payos webhook_enabled=true port=%s", os.getenv("PAYMENT_PORT", "8080"))
         except BaseException:
+            log.exception("payment.webhook_start_failed")
             await self.runner.cleanup()
             self.runner = None
             raise
@@ -70,6 +73,7 @@ class PaymentService:
                             "Trạng thái được xác minh trực tiếp với payOS.", content_type="text/plain")
 
     async def ensure_payment(self, order):
+        log.info("payment.ensure_started order=%s provider=%s", order["code"], order["provider"])
         if not self.client or order["provider"] != "payos":
             raise StoreError("Đơn này không dùng payOS hoặc payOS chưa được bật.")
         lock = self.locks.setdefault(order["code"], asyncio.Lock())
@@ -78,6 +82,7 @@ class PaymentService:
             if order["status"] != "pending":
                 raise StoreError("Chỉ tạo thanh toán cho đơn đang chờ.")
             if order["link_id"]:
+                log.info("payment.link_reused order=%s", order["code"])
                 return order
             if order["expires_at"] <= int(time.time()):
                 raise StoreError("Đơn đã qua thời gian tạo link. Nhờ quản trị viên kiểm tra tại payOS trước khi hủy.")
@@ -97,11 +102,13 @@ class PaymentService:
                     parsed.hostname == "payos.vn" or parsed.hostname.endswith(".payos.vn")):
                 raise StoreError("payOS trả link thanh toán không hợp lệ.")
             await asyncio.to_thread(self.db.bind_payment, order["code"], data)
+            log.info("payment.link_created order=%s", order["code"])
             return await asyncio.to_thread(self.db.order, order["code"])
 
     async def sync(self, order):
         if not self.client or order["provider"] != "payos":
             return order
+        log.debug("payment.sync_started order=%s", order["code"])
         # SDK verifies API response signatures. GET also recovers a link created before a crash.
         remote = await asyncio.to_thread(self.client.payment_requests.get, order["code"])
         data = remote.model_dump_camel_case()
@@ -112,10 +119,12 @@ class PaymentService:
                 "paymentLinkId": data["id"], "checkoutUrl": "https://pay.payos.vn/web/" + data["id"],
                 "qrCode": "", "description": "DH" + str(order["code"])[-7:],
             })
-        await asyncio.to_thread(self.db.reconcile, order["code"], data)
+        status = await asyncio.to_thread(self.db.reconcile, order["code"], data)
+        log.info("payment.synced order=%s status=%s", order["code"], status)
         return await asyncio.to_thread(self.db.order, order["code"])
 
     async def cancel(self, order):
+        log.info("payment.cancel_requested order=%s status=%s", order["code"], order["status"])
         if order["provider"] == "manual":
             raise StoreError("Dùng hủy đơn thủ công.")
         if not self.client:
@@ -127,6 +136,7 @@ class PaymentService:
         return await self.sync(order)
 
     async def webhook(self, request):
+        log.info("payment.webhook_received")
         if not self.client:
             raise web.HTTPServiceUnavailable()
         raw = await request.read()
@@ -140,15 +150,18 @@ class PaymentService:
             link, reference = data["paymentLinkId"], data["reference"]
             if type(code) is not int or type(amount) is not int or amount <= 0 or not link or not reference:
                 raise ValueError("Invalid payment identifiers")
-        except Exception:
-            log.warning("Rejected invalid payOS webhook")
+        except Exception as exc:
+            # Verification exceptions may include untrusted request bodies; record type only.
+            log.warning("payment.webhook_rejected error_type=%s", type(exc).__name__)
             return web.json_response({"success": False}, status=400)
         try:
             result = await asyncio.to_thread(self.db.receive, code, amount, link, reference, data.get("currency"))
         except Exception:
-            log.exception("Could not persist payment webhook")
+            log.exception("payment.webhook_persist_failed order=%s", code)
             return web.json_response({"success": False}, status=503)
         if result == "retry":
+            log.warning("payment.webhook_retry_required order=%s", code)
             return web.json_response({"success": False}, status=503)
         # Unknown signed sample events (sent during webhook registration) are safely acknowledged.
+        log.info("payment.webhook_processed order=%s result=%s", code, result)
         return web.json_response({"success": True})

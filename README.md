@@ -39,3 +39,5 @@ Mô tả được gửi đến nhà cung cấp AI đã cấu hình. Không nhậ
 Chưa cần token để kiểm tra schema. Kiểm thử Discord và AI thực cần tài khoản/API đã cấu hình.
 
 Panel và ticket mua hàng riêng: xem [TICKETS.md](TICKETS.md).
+
+Console/file logs, mã tra lỗi và cấu hình debug: [DEBUGGING.md](DEBUGGING.md).

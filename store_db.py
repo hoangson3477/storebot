@@ -5,8 +5,15 @@ import secrets
 import sqlite3
 import time
 
+from diagnostics import db_operation
+
 
 class StoreError(ValueError):
+    pass
+
+
+class DatabaseUnavailable(StoreError):
+    """A temporary connection failure, before any transaction has started."""
     pass
 
 
@@ -81,11 +88,13 @@ class StoreDB:
     def notice(db, code, status):
         db.execute("INSERT OR IGNORE INTO outbox(order_code,status) VALUES(?,?)", (code, status))
 
+    @db_operation
     def settings(self, guild):
         with self.connect() as db:
             row = db.execute("SELECT * FROM settings WHERE guild_id=?", (guild,)).fetchone()
             return dict(row) if row else {}
 
+    @db_operation
     def init_tickets(self):
         # Portable additive schema: also used by PostgreSQL, without resetting store data.
         with self.connect(True) as db:
@@ -94,17 +103,20 @@ class StoreDB:
                        "guild_id BIGINT NOT NULL, buyer_id BIGINT NOT NULL, channel_id BIGINT NOT NULL UNIQUE, "
                        "closed BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL)")
 
+    @db_operation
     def ticket_category(self, guild):
         with self.connect() as db:
             row = db.execute("SELECT category_id FROM ticket_settings WHERE guild_id=?", (guild,)).fetchone()
             return row["category_id"] if row else None
 
+    @db_operation
     def configure_tickets(self, guild, actor, category):
         with self.connect(True) as db:
             db.execute("INSERT INTO ticket_settings(guild_id,category_id) VALUES(?,?) ON CONFLICT(guild_id) "
                        "DO UPDATE SET category_id=excluded.category_id", (guild, category))
             self.audit(db, guild, actor, "ticket_configure", str(category))
 
+    @db_operation
     def ticket(self, guild, *, code=None, channel=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM tickets WHERE guild_id=? AND " +
@@ -112,6 +124,7 @@ class StoreDB:
                              (guild, code if code is not None else channel)).fetchone()
             return dict(row) if row else None
 
+    @db_operation
     def bind_ticket(self, code, guild, buyer, channel):
         with self.connect(True) as db:
             order = db.execute("SELECT * FROM orders WHERE code=? AND guild_id=? AND buyer_id=?",
@@ -125,10 +138,12 @@ class StoreDB:
                        (code, guild, buyer, channel, int(time.time())))
             self.audit(db, guild, buyer, "ticket_open", f"{code}: channel={channel}")
 
+    @db_operation
     def forget_missing_ticket(self, guild, channel):
         with self.connect(True) as db:
             db.execute("DELETE FROM tickets WHERE guild_id=? AND channel_id=? AND closed=0", (guild, channel))
 
+    @db_operation
     def close_ticket(self, guild, channel, actor):
         with self.connect(True) as db:
             row = db.execute("SELECT t.*,o.status FROM tickets t JOIN orders o ON o.code=t.order_code "
@@ -140,6 +155,7 @@ class StoreDB:
             db.execute("UPDATE tickets SET closed=1 WHERE channel_id=?", (channel,))
             self.audit(db, guild, actor, "ticket_close", str(row["order_code"]))
 
+    @db_operation
     def configure(self, guild, actor, staff, channel):
         with self.connect(True) as db:
             db.execute("INSERT INTO settings VALUES(?,?,?) ON CONFLICT(guild_id) DO UPDATE SET "
@@ -147,6 +163,7 @@ class StoreDB:
                        (guild, staff, channel))
             self.audit(db, guild, actor, "configure", f"staff={staff}, log={channel}")
 
+    @db_operation
     def add_product(self, guild, actor, sku, name, description, price, stock):
         if not (1 <= len(sku) <= 32 and sku.isascii() and all(c.isalnum() or c in "-_" for c in sku)):
             raise StoreError("SKU cần 1–32 ký tự chữ/số ASCII, dấu - hoặc _.")
@@ -162,6 +179,7 @@ class StoreDB:
                 raise StoreError("SKU đã tồn tại trong server.") from exc
             self.audit(db, guild, actor, "add_product", sku.upper())
 
+    @db_operation
     def edit_product(self, guild, actor, sku, price=None, stock_delta=0, active=None):
         if price is not None and not 1000 <= price <= 1_000_000_000:
             raise StoreError("Giá từ 1.000 đến 1 tỷ VND.")
@@ -177,12 +195,14 @@ class StoreDB:
                         int(active) if active is not None else row["active"], row["id"]))
             self.audit(db, guild, actor, "edit_product", f"{sku}: price={price}, delta={stock_delta}, active={active}")
 
+    @db_operation
     def products(self, guild, page=1):
         with self.connect() as db:
             return [dict(r) for r in db.execute(
                 "SELECT * FROM products WHERE guild_id=? AND active=1 ORDER BY id LIMIT 10 OFFSET ?",
                 (guild, (page - 1) * 10))]
 
+    @db_operation
     def reserve(self, guild, buyer, sku, quantity, provider, ttl=900, bank=None):
         if not 1 <= quantity <= 100:
             raise StoreError("Số lượng từ 1 đến 100.")
@@ -225,6 +245,7 @@ class StoreDB:
                 self.notice(db, code, "pending")
             return dict(db.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone())
 
+    @db_operation
     def order(self, code, guild=None):
         with self.connect() as db:
             row = db.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
@@ -232,6 +253,7 @@ class StoreDB:
                 raise StoreError("Không tìm thấy đơn trong server này.")
             return dict(row)
 
+    @db_operation
     def list_orders(self, guild, buyer=None, page=1):
         with self.connect() as db:
             query = "SELECT * FROM orders WHERE guild_id=?"
@@ -242,6 +264,7 @@ class StoreDB:
             return [dict(r) for r in db.execute(query + " ORDER BY created_at DESC,code DESC LIMIT 10 OFFSET ?",
                                                 (*args, (page - 1) * 10))]
 
+    @db_operation
     def transfer_order(self, memo, guild):
         with self.connect() as db:
             row = db.execute("SELECT * FROM orders WHERE guild_id=? AND provider='manual' AND description=?",
@@ -250,6 +273,7 @@ class StoreDB:
                 raise StoreError("Không tìm thấy mã chuyển khoản trong server này.")
             return dict(row)
 
+    @db_operation
     def bind_payment(self, code, data):
         with self.connect(True) as db:
             row = db.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
@@ -272,6 +296,7 @@ class StoreDB:
         self.notice(db, row["code"], "review")
         self.audit(db, row["guild_id"], None, "payment_review", f"{row['code']}: {reason}")
 
+    @db_operation
     def receive(self, code, amount, link_id, reference, currency="VND"):
         """Only called after SDK signature verification; duplicates cannot deliver twice."""
         with self.connect(True) as db:
@@ -313,6 +338,7 @@ class StoreDB:
         self.audit(db, row["guild_id"], None, "paid", str(row["code"]))
         return "paid"
 
+    @db_operation
     def reconcile(self, code, remote):
         with self.connect(True) as db:
             row = db.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
@@ -339,6 +365,7 @@ class StoreDB:
         self.audit(db, row["guild_id"], None, status, str(row["code"]))
         return status
 
+    @db_operation
     def manual_paid(self, code, guild, actor):
         with self.connect(True) as db:
             row = db.execute("SELECT * FROM orders WHERE code=? AND guild_id=?", (code, guild)).fetchone()
@@ -350,6 +377,7 @@ class StoreDB:
             self.audit(db, guild, actor, "manual_paid", str(code))
             return result
 
+    @db_operation
     def manual_cancel(self, code, guild, actor):
         with self.connect(True) as db:
             row = db.execute("SELECT * FROM orders WHERE code=? AND guild_id=?", (code, guild)).fetchone()
@@ -358,6 +386,7 @@ class StoreDB:
             self.audit(db, guild, actor, "manual_cancel", str(code))
             return self._release(db, row, "cancelled")
 
+    @db_operation
     def advance(self, code, guild, actor, status):
         expected = {"fulfilling": "paid", "completed": "fulfilling"}.get(status)
         if expected is None:
@@ -370,6 +399,7 @@ class StoreDB:
             self.notice(db, code, status)
             self.audit(db, guild, actor, status, str(code))
 
+    @db_operation
     def maintenance(self):
         now = int(time.time())
         with self.connect(True) as db:
@@ -383,23 +413,27 @@ class StoreDB:
                 db.execute("UPDATE orders SET checked_at=? WHERE code=?", (now, row["code"]))
             return [dict(r) for r in rows]
 
+    @db_operation
     def notifications(self):
         with self.connect() as db:
             return [dict(r) for r in db.execute("SELECT n.id AS notice_id,n.status AS notice_status,n.attempts,o.* "
                 "FROM outbox n JOIN orders o ON o.code=n.order_code WHERE n.delivered=0 AND n.attempts<6 "
                 "AND n.retry_at<=? ORDER BY n.id LIMIT 20", (int(time.time()),))]
 
+    @db_operation
     def notification_done(self, notice_id, ok):
         with self.connect(True) as db:
             db.execute("UPDATE outbox SET delivered=?,attempts=attempts+1,retry_at=? WHERE id=?",
                        (int(ok), int(time.time()) + 60, notice_id))
 
+    @db_operation
     def revenue(self, guild):
         with self.connect() as db:
             return dict(db.execute("SELECT count(*) AS orders,coalesce(sum(total),0) AS collected,"
                 "coalesce(sum(CASE WHEN status='completed' THEN total ELSE 0 END),0) AS completed "
                 "FROM orders WHERE guild_id=? AND status IN ('paid','fulfilling','completed')", (guild,)).fetchone())
 
+    @db_operation
     def resolve_unpaid(self, code, guild, actor, note):
         """Admin attests dashboard/bank inspection; never pretend to perform a refund."""
         if len(note.strip()) < 10:

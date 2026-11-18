@@ -5,6 +5,7 @@ import logging
 import discord
 
 from store_db import StoreError
+from diagnostics import interaction_context
 
 log = logging.getLogger(__name__)
 
@@ -47,11 +48,14 @@ class TicketControls(discord.ui.View):
         self.manager = manager
 
     async def run(self, interaction, action):
+        interaction_context(interaction)
+        log.info("ticket.action_started action=%s", action)
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             row = await self.manager.current(interaction)
             cog = self.manager.cog
             order = await asyncio.to_thread(cog.db.order, row["order_code"], interaction.guild_id)
+            log.info("ticket.action_order action=%s order=%s status=%s", action, row["order_code"], order["status"])
             if action == "close":
                 if not await cog.staff(interaction.guild, interaction.user.id):
                     raise StoreError("Chỉ nhân viên hoặc admin được đóng ticket.")
@@ -71,15 +75,18 @@ class TicketControls(discord.ui.View):
                     "Khách báo đã chuyển tiền. Nhân viên kiểm tra giao dịch ngân hàng rồi dùng "
                     f"`/store paid code: {order.get('description') or order['code']}` nếu đúng tiền. "
                     "Thông báo này chưa xác nhận thanh toán.")
+                log.info("ticket.transfer_reported order=%s verified=false", row["order_code"])
                 return await interaction.followup.send("Đã báo trong ticket để nhân viên kiểm tra.", ephemeral=True)
             from store import payment_message
             await interaction.followup.send(**payment_message(order), ephemeral=True)
         except (StoreError, discord.Forbidden) as exc:
+            log.warning("ticket.action_rejected action=%s error_type=%s reason=%s", action, type(exc).__name__, exc,
+                        exc_info=isinstance(exc, discord.Forbidden))
             text = str(exc) if isinstance(exc, StoreError) else "Bot thiếu quyền thao tác trong ticket."
             await interaction.followup.send(text, ephemeral=True)
         except Exception:
-            log.exception("Ticket action failed")
-            await interaction.followup.send("Có lỗi xử lý ticket. Dùng /store order để kiểm tra đơn.", ephemeral=True)
+            log.exception("ticket.action_failed action=%s", action)
+            await interaction.followup.send(f"Có lỗi xử lý ticket. Mã tra log: {interaction.id}. Dùng /store order để kiểm tra đơn.", ephemeral=True)
 
     @discord.ui.button(label="Xem đơn / QR", custom_id="manageandstore:ticket:refresh:v1")
     async def refresh(self, interaction, button):
@@ -117,9 +124,11 @@ class TicketManager:
     async def check_private(self, channel, row):
         settings = await asyncio.to_thread(self.cog.db.settings, row["guild_id"])
         if not ticket_private(channel, row["buyer_id"], settings.get("staff_role_id"), self.cog.bot.user.id):
+            log.error("ticket.privacy_check_failed guild=%s channel=%s buyer=%s", row["guild_id"], channel.id, row["buyer_id"])
             raise StoreError("Quyền ticket đã thay đổi và không còn riêng tư. Nhờ admin kiểm tra quyền kênh.")
 
     async def open(self, guild, order):
+        log.info("ticket.open_started guild=%s order=%s buyer=%s", guild.id, order["code"], order["buyer_id"])
         async with self.lock:
             existing = await asyncio.to_thread(self.cog.db.ticket, guild.id, code=order["code"])
             if existing:
@@ -128,9 +137,11 @@ class TicketManager:
                 try:
                     channel = await guild.fetch_channel(existing["channel_id"])
                 except discord.NotFound:
+                    log.warning("ticket.channel_missing order=%s channel=%s recreating=true", order["code"], existing["channel_id"])
                     await asyncio.to_thread(self.cog.db.forget_missing_ticket, guild.id, existing["channel_id"])
                 else:
                     await self.check_private(channel, existing)
+                    log.info("ticket.reused order=%s channel=%s", order["code"], channel.id)
                     return channel
             if order["status"] in ("completed", "cancelled", "expired"):
                 raise StoreError("Không mở ticket mới cho đơn đã kết thúc.")
@@ -152,13 +163,20 @@ class TicketManager:
             channel = await guild.create_text_channel(name, category=category,
                 overwrites=ticket_overwrites(guild, buyer, staff, me),
                 topic=f"Store order {order['code']} | buyer {buyer.id}", reason=f"Purchase ticket {order['code']}")
+            log.info("ticket.channel_created order=%s channel=%s category=%s", order["code"], channel.id, category.id)
             try:
                 await self.check_private(channel, {"guild_id": guild.id, "buyer_id": buyer.id})
                 await self.welcome(channel, buyer, order)
                 await asyncio.to_thread(self.cog.db.bind_ticket, order["code"], guild.id, buyer.id, channel.id)
             except Exception:
-                await channel.delete(reason="Could not register private store ticket")
+                log.exception("ticket.registration_failed order=%s channel=%s rollback=true", order["code"], channel.id)
+                try:
+                    await channel.delete(reason="Could not register private store ticket")
+                    log.warning("ticket.rollback_completed order=%s channel=%s", order["code"], channel.id)
+                except discord.HTTPException:
+                    log.exception("ticket.rollback_failed order=%s channel=%s manual_cleanup_required=true", order["code"], channel.id)
                 raise
+            log.info("ticket.open_completed order=%s channel=%s", order["code"], channel.id)
             return channel
 
     async def welcome(self, channel, buyer, order):
@@ -173,6 +191,7 @@ class TicketManager:
             **kwargs, allowed_mentions=discord.AllowedMentions(users=[buyer]))
 
     async def close(self, guild, channel, actor):
+        log.info("ticket.close_started guild=%s channel=%s actor=%s", guild.id, channel.id, actor)
         async with self.lock:
             row = await asyncio.to_thread(self.cog.db.ticket, guild.id, channel=channel.id)
             if not row or row["closed"]:
@@ -193,4 +212,5 @@ class TicketManager:
             overwrite.send_messages_in_threads = False
             await channel.set_permissions(buyer, overwrite=overwrite, reason=f"Store ticket closed by {actor}")
             await asyncio.to_thread(self.cog.db.close_ticket, guild.id, channel.id, actor)
+            log.info("ticket.closed order=%s channel=%s actor=%s", row["order_code"], channel.id, actor)
             await channel.send("Ticket đã đóng. Lịch sử được giữ lại; đơn hàng và thanh toán không bị xóa.")

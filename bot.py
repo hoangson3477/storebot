@@ -3,6 +3,8 @@ import io
 import json
 import logging
 import os
+import time
+import sys
 
 import aiohttp
 import discord
@@ -13,9 +15,11 @@ from dotenv import load_dotenv
 from plan import Plan
 from ai_setup import propose
 from help_content import build_help
+from diagnostics import configure_logging, begin_command, context, interaction_context, unwrap_error
 
 load_dotenv()
 log = logging.getLogger(__name__)
+APP_BUILD = "2026.11.18-dns-retry-1"
 locks: dict[int, asyncio.Lock] = {}
 
 
@@ -42,6 +46,8 @@ class Confirm(discord.ui.View):
 
     @discord.ui.button(label="Xác nhận tạo", style=discord.ButtonStyle.green)
     async def apply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        interaction_context(interaction)
+        log.info("setup.confirm guild=%s actor=%s", interaction.guild_id, interaction.user.id)
         if self.used:
             return await interaction.response.send_message("Bản này đã được xử lý.", ephemeral=True)
         self.used = True
@@ -74,12 +80,14 @@ class Confirm(discord.ui.View):
                     raise ValueError("Category cùng tên đã tồn tại. Hãy yêu cầu cấu trúc khác để tránh trùng.")
                 reason = f"AI setup confirmed by {member.id}"
                 staff = await guild.create_role(name=self.plan.staff_role, permissions=discord.Permissions.none(), reason=reason)
+                log.info("setup.role_created role=%s", staff.id)
                 created.append(staff)
                 for cat in self.plan.categories:
                     category = await guild.create_category(cat.name, overwrites={
                         me: discord.PermissionOverwrite(view_channel=True, manage_channels=True),
                     }, reason=reason)
                     created.append(category)
+                    log.info("setup.category_created channel=%s", category.id)
                     for ch in cat.channels:
                         private = ch.access == "staff"
                         readonly = ch.access == "readonly"
@@ -105,16 +113,20 @@ class Confirm(discord.ui.View):
                             new = await guild.create_voice_channel(ch.name, category=category,
                                 overwrites=overwrites, reason=reason)
                         created.append(new)
+                        log.info("setup.channel_created channel=%s kind=%s access=%s", new.id, ch.kind, ch.access)
+                log.info("setup.completed resources=%s", len(created))
                 await interaction.followup.send(f"Đã tạo {len(created)} tài nguyên. Bạn có thể gán role {staff.mention} cho nhân viên.",
                                                 allowed_mentions=discord.AllowedMentions.none())
             except Exception:
-                log.exception("Setup failed; rolling back newly created resources")
+                log.exception("setup.failed rollback_resources=%s", len(created))
                 remaining = []
                 for resource in reversed(created):
                     try:
                         await resource.delete(reason="Rollback incomplete AI setup")
                     except discord.HTTPException:
+                        log.exception("setup.rollback_failed resource=%s", resource.id)
                         remaining.append(str(resource.id))
+                log.warning("setup.rollback_finished remaining=%s", remaining)
                 text = "Setup không thành công. Kiểm tra quyền bot, tên trùng và giới hạn server."
                 text += (" Chưa dọn được các ID: " + ", ".join(remaining)) if remaining else " Đã dọn tài nguyên vừa tạo."
                 await interaction.followup.send(text, ephemeral=True)
@@ -122,33 +134,69 @@ class Confirm(discord.ui.View):
 
     @discord.ui.button(label="Hủy", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        interaction_context(interaction)
         if self.used:
             return await interaction.response.send_message("Bản setup này đang được xử lý hoặc đã kết thúc.", ephemeral=True)
         self.used = True
+        log.info("setup.cancelled")
         self.stop()
         await interaction.response.edit_message(content="Đã hủy setup.", view=None)
 
 
 class Bot(commands.Bot):
     async def setup_hook(self):
+        log.info("startup.extension_loading extension=store")
         await self.load_extension("store")
+        log.info("startup.extension_loaded extension=store")
         test = os.getenv("TEST_GUILD_ID")
         if test:
             guild = discord.Object(id=int(test))
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("startup.commands_synced scope=guild guild=%s commands=%s", guild.id, len(synced))
         else:
-            await self.tree.sync()
+            synced = await self.tree.sync()
+            log.info("startup.commands_synced scope=global commands=%s", len(synced))
 
     async def close(self):
+        log.info("shutdown.started")
         if "store" in self.extensions:
             await self.unload_extension("store")
         await super().close()
+        log.info("shutdown.completed")
 
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = Bot(command_prefix="!", intents=intents, help_command=None, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.before_invoke
+async def log_command_started(ctx):
+    begin_command(ctx)
+    log.info("command.started command=%s mode=%s", ctx.command.qualified_name,
+             "slash" if ctx.interaction else "prefix")
+
+
+@bot.after_invoke
+async def log_command_finished(ctx):
+    log.info("command.finished command=%s failed=%s elapsed_ms=%.0f", ctx.command.qualified_name,
+             ctx.command_failed, (time.monotonic() - getattr(ctx, "log_started", time.monotonic())) * 1000)
+
+
+@bot.event
+async def on_disconnect():
+    log.warning("gateway.disconnected waiting_for_reconnect=true")
+
+
+@bot.event
+async def on_resumed():
+    log.info("gateway.resumed")
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    log.exception("discord.event_failed event=%s", event)
 
 
 @bot.hybrid_command(name="help", description="Hướng dẫn setup AI, mua hàng và quản lý cửa hàng")
@@ -182,9 +230,12 @@ async def setup_command(ctx: commands.Context, *, describe: str):
     try:
         plan = await propose(describe)
     except (ValueError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        log.warning("setup.plan_failed error_type=%s", type(exc).__name__, exc_info=True)
         text = str(exc) if isinstance(exc, ValueError) else "Không kết nối được AI. Thử lại sau."
         return await ctx.send(text, ephemeral=True)
     data = preview(plan).encode("utf-8")
+    log.info("setup.preview_ready categories=%s channels=%s", len(plan.categories),
+             sum(len(category.channels) for category in plan.categories))
     await ctx.send("Bản đề xuất đính kèm: public = công khai; readonly = chỉ nhân viên gửi; staff = nội bộ. "
                    "Tạo mới theo bản này, không xóa kênh cũ. Xác nhận trong 3 phút. "
                    "Role khác có quyền ghi đè hoặc Administrator vẫn có thể truy cập theo quyền Discord.",
@@ -200,19 +251,30 @@ async def on_command_error(ctx, error):
         return
     if isinstance(error, commands.CommandNotFound):
         return
+    begin_command(ctx)
+    original = unwrap_error(error)
     if isinstance(error, commands.UserInputError):
         text = "Dùng /setup describe: mô tả hoặc !setup mô tả server."
     elif isinstance(error, (commands.CheckFailure, commands.CommandOnCooldown, commands.MaxConcurrencyReached)):
         text = "Cần quyền Administrator, bot cần Manage Channels/Manage Roles; mỗi server chờ 60 giây giữa các yêu cầu."
     else:
-        log.error("Command failed", exc_info=(type(error), error, error.__traceback__))
-        text = "Có lỗi xử lý. Xem log bot để biết chi tiết."
+        log.error("command.failed command=%s error_type=%s", ctx.command, type(original).__name__,
+                  exc_info=(type(original), original, original.__traceback__))
+        text = f"Có lỗi xử lý. Mã tra log: {ctx.log_reference}."
+    if isinstance(error, (commands.UserInputError, commands.CheckFailure, commands.CommandOnCooldown, commands.MaxConcurrencyReached)):
+        log.warning("command.rejected command=%s error_type=%s", ctx.command, type(error).__name__)
     await ctx.send(text, ephemeral=True)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
     token = os.getenv("DISCORD_TOKEN")
     if not token:
+        log.error("startup.missing_configuration variable=DISCORD_TOKEN")
         raise SystemExit("Thiếu DISCORD_TOKEN trong .env")
-    bot.run(token, log_handler=None)
+    log.info("startup.begin build=%s python=%s discord_py=%s", APP_BUILD, sys.version.split()[0], discord.__version__)
+    try:
+        bot.run(token, log_handler=None)
+    except Exception:
+        log.exception("startup_or_runtime.fatal")
+        raise SystemExit(1)

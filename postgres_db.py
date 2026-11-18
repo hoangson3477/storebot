@@ -1,7 +1,34 @@
 """PostgreSQL transport for the shared, transaction-based store domain operations."""
 from contextlib import contextmanager
+import logging
+import time
 
-from store_db import StoreDB
+from store_db import StoreDB, DatabaseUnavailable
+from network_health import temporary_dns_error
+
+log = logging.getLogger(__name__)
+
+
+def connect_with_dns_retry(connect):
+    """Retry connection establishment only. Never replay a transaction or commit."""
+    for attempt in range(1, 4):
+        try:
+            connection = connect()
+        except Exception as exc:
+            if not temporary_dns_error(exc):
+                raise
+            if attempt == 3:
+                log.exception("db.dns_unavailable attempts=%s transaction_started=false", attempt)
+                raise DatabaseUnavailable(
+                    "Host đang lỗi DNS khi kết nối database. Vui lòng thử lại sau; "
+                    "nếu đang mua hàng, kiểm tra /store orders trước khi đặt lại.") from exc
+            delay = 2 ** (attempt - 1)
+            log.warning("db.dns_retry attempt=%s max_attempts=3 delay_seconds=%s transaction_started=false", attempt, delay)
+            time.sleep(delay)  # Only called inside DB workers / initial startup.
+        else:
+            if attempt > 1:
+                log.info("db.dns_recovered attempt=%s", attempt)
+            return connection
 
 
 class SQLConnection:
@@ -40,8 +67,9 @@ class PostgresStoreDB(StoreDB):
         import psycopg
         from psycopg.rows import dict_row
         # Supabase's pooler pools physical server connections. No automatic prepared statements.
-        with psycopg.connect(self.url, row_factory=dict_row, prepare_threshold=None,
-                             sslmode=self.sslmode, connect_timeout=10) as connection:
+        connection = connect_with_dns_retry(lambda: psycopg.connect(
+            self.url, row_factory=dict_row, prepare_threshold=None, sslmode=self.sslmode, connect_timeout=10))
+        with connection:
             connection.execute("SET LOCAL search_path TO storebot, pg_catalog")
             connection.execute("SET LOCAL statement_timeout = '15s'")
             connection.execute("SET LOCAL lock_timeout = '10s'")
